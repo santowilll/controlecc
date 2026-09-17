@@ -6,8 +6,9 @@ import { useRouter } from "next/navigation";
 import React, { useEffect, useMemo, useState } from "react";
 import { collection, query, getDocs, doc, setDoc } from "firebase/firestore";
 import { db, storage } from "@/config/firebase.config";
-import { FilterIcon } from "lucide-react";
+import { FileDownIcon, FilterIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -20,6 +21,7 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import { ref, getDownloadURL } from "firebase/storage";
+import { PDFDocument } from "pdf-lib";
 import { LoadingSpinner } from "@/components/ui/loader";
 import withAuthorization from "@/components/with-authorization";
 import { useToast } from "@/hooks/use-toast";
@@ -63,14 +65,18 @@ const statusesColors: any = {
 };
 
 const ValidationPage = () => {
-  const [filesList, setFilesList] = useState([]);
+  const [filesList, setFilesList] = useState<any[]>([]);
   const [currentFile, setCurrentFile] = useState<any>(null);
   const [loading, setLoading] = useState(false);
   const [pdfLoading, setPdfLoading] = useState(false);
+  const [mergedPdfLoading, setMergedPdfLoading] = useState(false);
   const [downloadLoadingFiles, setDownloadLoadingFiles] = useState<
     Record<string, boolean>
   >({});
   const [filtersVisible, setFiltersVisible] = useState(false);
+  const [selectedUserId, setSelectedUserId] = useState("");
+  const [userSearch, setUserSearch] = useState("");
+  const [showUserSuggestions, setShowUserSuggestions] = useState(false);
   const [formValidation, setFormValidation] = useState({
     status: "",
     workload: "",
@@ -122,12 +128,8 @@ const ValidationPage = () => {
 
   useEffect(() => {
     if (status === "loading") return;
-
-    if (!session) {
-      router.push("/login");
-    } else if (session.user.role !== "admin") {
-      router.push("/files");
-    }
+    if (!session) router.push("/login");
+    else if (session.user.role !== "admin") router.push("/files");
   }, [session, status]);
 
   async function getAllFiles() {
@@ -179,8 +181,39 @@ const ValidationPage = () => {
     }
   }
 
+  const usersList = useMemo(() => {
+    const users = new Map<string, string>();
+
+    filesList.forEach((file: any) => {
+      if (file.userId && file.user?.fullname) {
+        users.set(file.userId, file.user.fullname);
+      }
+    });
+
+    return Array.from(users.entries()).sort((a, b) =>
+      a[1].localeCompare(b[1])
+    );
+  }, [filesList]);
+
+  const filteredUsersList = useMemo(() => {
+    if (!userSearch.trim()) {
+      return usersList;
+    }
+
+    return usersList.filter(([, fullname]) =>
+      fullname.toLowerCase().includes(userSearch.toLowerCase())
+    );
+  }, [usersList, userSearch]);
+
   const filteredFilesList = useMemo(() => {
     let filteredList = [...filesList];
+
+    if (selectedUserId) {
+      filteredList = filteredList.filter(
+        (item: any) => item.userId === selectedUserId
+      );
+    }
+
     if (filters.status !== "all") {
       filteredList = filteredList.filter(
         (item: any) => item.status === filters.status
@@ -222,7 +255,7 @@ const ValidationPage = () => {
     }
 
     return filteredList;
-  }, [filesList, filters]);
+  }, [filesList, filters, selectedUserId]);
 
   useEffect(() => {
     getAllFiles();
@@ -278,6 +311,120 @@ const ValidationPage = () => {
       console.error("Erro ao obter a URL do PDF:", error);
     } finally {
       setDownloadLoadingFiles((prev) => ({ ...prev, [fileId]: false }));
+    }
+  };
+
+  const handleDownloadMergedPdf = async () => {
+    if (!selectedUserId) {
+      toast({
+        title: "Selecione um aluno",
+        description: "Escolha um aluno antes de gerar o PDF.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    const approvedFiles = filesList
+      .filter(
+        (file: any) =>
+          file.userId === selectedUserId &&
+          file.status === "approved" &&
+          file.archived !== true &&
+          file.pathFile
+      )
+      .sort((a: any, b: any) => {
+        const dateA = a.createdAt?.seconds || 0;
+        const dateB = b.createdAt?.seconds || 0;
+        return dateA - dateB;
+      });
+
+    if (approvedFiles.length === 0) {
+      toast({
+        title: "Nenhum certificado aprovado",
+        description:
+          "Este aluno não possui certificados aprovados disponíveis para gerar o PDF.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    setMergedPdfLoading(true);
+
+    try {
+      const mergedPdf = await PDFDocument.create();
+
+      for (const file of approvedFiles) {
+        const storageRef = ref(storage, file.pathFile);
+        const url = await getDownloadURL(storageRef);
+        const response = await fetch(url);
+
+        if (!response.ok) {
+          throw new Error(
+            `Falha ao baixar "${file.description}". HTTP ${response.status}`
+          );
+        }
+
+        const bytes = await response.arrayBuffer();
+        const sourcePdf = await PDFDocument.load(bytes);
+        const copiedPages = await mergedPdf.copyPages(
+          sourcePdf,
+          sourcePdf.getPageIndices()
+        );
+
+        copiedPages.forEach((page) => {
+          mergedPdf.addPage(page);
+        });
+      }
+
+      const mergedPdfBytes = await mergedPdf.save();
+
+      const blob = new Blob([mergedPdfBytes as BlobPart], {
+        type: "application/pdf",
+      });
+
+      const url = URL.createObjectURL(blob);
+
+      const selectedUser = usersList.find(
+        ([userId]) => userId === selectedUserId
+      );
+
+      const studentName = selectedUser?.[1] || "aluno";
+
+      const safeStudentName = studentName
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .replace(/[^a-zA-Z0-9]+/g, "-")
+        .replace(/^-|-$/g, "");
+
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `certificados-${safeStudentName}.pdf`;
+
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+
+      setTimeout(() => {
+        URL.revokeObjectURL(url);
+      }, 1000);
+
+      toast({
+        title: "PDF gerado com sucesso",
+        description: `${approvedFiles.length} certificado(s) aprovado(s) foram reunidos em um único PDF.`,
+        variant: "default",
+      });
+    } catch (error: any) {
+      console.error("Erro ao gerar PDF único:", error);
+
+      toast({
+        title: "Erro ao gerar o PDF",
+        description:
+          error?.message ||
+          "Não foi possível reunir os certificados deste aluno.",
+        variant: "destructive",
+      });
+    } finally {
+      setMergedPdfLoading(false);
     }
   };
 
@@ -363,12 +510,84 @@ const ValidationPage = () => {
             <h2 className="text-3xl font-semibold tracking-tight first:mt-0">
               Validação de atividades
             </h2>
-            <Button
-              variant="outline"
-              onClick={() => setFiltersVisible(!filtersVisible)}
-            >
-              <FilterIcon size={18} />
-            </Button>
+            <div className="flex items-center gap-2">
+              <div className="relative w-[280px]">
+                <Input
+                  type="text"
+                  placeholder="Pesquisar aluno"
+                  value={userSearch}
+                  className="pr-9"
+                  onFocus={() => setShowUserSuggestions(true)}
+                  onChange={(e) => {
+                    setUserSearch(e.target.value);
+                    setSelectedUserId("");
+                    setShowUserSuggestions(true);
+                  }}
+                />
+
+                {userSearch && (
+                  <button
+                    type="button"
+                    aria-label="Limpar aluno selecionado"
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                    onClick={() => {
+                      setUserSearch("");
+                      setSelectedUserId("");
+                      setShowUserSuggestions(false);
+                    }}
+                  >
+                    ✕
+                  </button>
+                )}
+
+                {showUserSuggestions && (
+                  <div className="absolute z-50 mt-1 w-full max-h-60 overflow-y-auto rounded-md border bg-background shadow-md">
+                    {filteredUsersList.length > 0 ? (
+                      filteredUsersList.map(([userId, fullname]) => (
+                        <button
+                          key={userId}
+                          type="button"
+                          className="w-full px-3 py-2 text-left text-sm hover:bg-accent"
+                          onClick={() => {
+                            setSelectedUserId(userId);
+                            setUserSearch(fullname);
+                            setShowUserSuggestions(false);
+                          }}
+                        >
+                          {fullname}
+                        </button>
+                      ))
+                    ) : (
+                      <div className="px-3 py-2 text-sm text-muted-foreground">
+                        Nenhum aluno encontrado
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              <Button
+                variant="outline"
+                disabled={!selectedUserId || mergedPdfLoading}
+                onClick={handleDownloadMergedPdf}
+              >
+                {mergedPdfLoading ? (
+                  <LoadingSpinner className="bg-dark" />
+                ) : (
+                  <>
+                    <FileDownIcon size={18} className="mr-2" />
+                    Baixar PDF único
+                  </>
+                )}
+              </Button>
+
+              <Button
+                variant="outline"
+                onClick={() => setFiltersVisible(!filtersVisible)}
+              >
+                <FilterIcon size={18} />
+              </Button>
+            </div>
           </div>
           <div
             className={`
